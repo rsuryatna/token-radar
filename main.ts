@@ -1,11 +1,13 @@
-// Token Radar's program, version radar-3 (Node 22, standard library only).
+// Token Radar's program, version radar-4 (Node 22, standard library only).
 //
 // It reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits the
-// radar-3 model on the snapshot's own live-token protocols, ranks every launch candidate
+// radar-4 model on the snapshot's own live-token protocols, ranks every launch candidate
 // by implied value, writes the ranked board to /output/board.json, writes the dashboard's
 // data beside the page as /output/data.js, copies this repository's dashboard/ and
 // screenshots/ to /output, and writes /output/dossier.json with the vendored make.fun
-// library. No clock, no randomness, no network: two runs write the same bytes.
+// library. No clock, no randomness, no network: two runs write the same bytes. The
+// bootstrap refits that give each row its rank range are seeded, so they are
+// deterministic too.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
@@ -95,12 +97,13 @@ const verdicts = { FARM: 0, THIN: 0, SKIP: 0 };
 for (const r of board) verdicts[r.verdict]++;
 const top = board[0]!;
 const bottom = board[board.length - 1]!;
+const s = radar.validation.survival;
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live, ${radar.set_aside_size} set aside)\n` +
     `token radar: comps log(mcap) = ${m.intercept} + ${m.tvl_coef} * log(TVL) + ${m.direction_coef} * direction, fitted on ${radar.validation.comps_protocols} live-token protocols\n` +
-    `token radar: held-out miss ${kept.label}: 5-fold x${kept.five_fold_miss}, single split x${kept.single_split_miss} (flat multiple x${radar.validation.comps[0]!.five_fold_miss})\n` +
-    `token radar: launch odds q=${m.survival_q} tau=${m.survival_tau} k=${m.survival_k}, held-out accuracy ${radar.validation.survival.accuracy} vs base ${radar.validation.survival.base_accuracy}\n` +
-    `token radar: top ${top.name} $${top.implied_value_usd.toLocaleString('en-US')}, bottom ${bottom.name} $${bottom.implied_value_usd.toLocaleString('en-US')}\n` +
+    `token radar: held-out miss ${kept.label}: 5-fold x${kept.five_fold_miss}, single split x${kept.single_split_miss}, temporal OLD-NEW x${kept.temporal_miss} (flat multiple x${radar.validation.comps[0]!.five_fold_miss})\n` +
+    `token radar: launch odds q=${m.survival_q} tau=${m.survival_tau} k=${m.survival_k}, held-out accuracy ${s.accuracy} vs base ${s.base_accuracy} (temporal ${s.temporal_accuracy} vs base ${s.temporal_base_accuracy}), Brier ${s.brier} vs base ${s.base_brier}\n` +
+    `token radar: top ${top.name} $${top.implied_value_usd.toLocaleString('en-US')} (rank range ${top.rank_low}-${top.rank_high}), bottom ${bottom.name} $${bottom.implied_value_usd.toLocaleString('en-US')}\n` +
     `token radar: farm verdicts at $${m.verdict_deposit_usd}: FARM ${verdicts.FARM}, THIN ${verdicts.THIN}, SKIP ${verdicts.SKIP}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

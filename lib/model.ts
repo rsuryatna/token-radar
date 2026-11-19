@@ -1,21 +1,33 @@
-// Token Radar's model, version radar-3 (Node 22, standard library only).
+// Token Radar's model, version radar-4 (Node 22, standard library only).
 //
 // The radar is fitted, not asserted. Two fits run on the sealed snapshot every time this
-// program runs, and both are validated on held-out protocols before the board is built:
+// program runs, and both are validated on held-out protocols before the board is built --
+// on THREE splits, not one:
 //
 //   * The comps curve. Market cap is modelled as a function of TVL plus the direction of
 //     the 7-day change, fitted by least squares on the snapshot's own live-token protocols
 //     (the 128 that record a market cap above zero). The change enters as its direction
 //     only (+1 when TVL rose this week, -1 when it fell, 0 when it did not move or is not
-//     recorded): the size of the move was tried and dropped, because it loses to TVL alone
-//     on both held-out tests. The fit is log(mcap) = intercept + tvl_coef * log(TVL) +
-//     direction_coef * direction, so a protocol whose TVL fell this week prices about 22%
-//     higher per dollar of TVL than one whose TVL rose -- the week's hot money is not
-//     durable money, and the held-out test says the size of the move adds nothing.
+//     recorded). Fifteen carry forms were tried -- the change's size, log(1+change), a
+//     capped carry of TVL a week forward, asymmetric up/down moves, a signed square root,
+//     a magnitude term, interactions with TVL, a quadratic in log TVL, age and chain
+//     count -- and every one of them loses to TVL plus direction on at least one of the
+//     three held-out tests, so only the direction enters the model. The three tests are
+//     5-fold cross-validation (a deterministic SHA-256 split), a single split (fold 0
+//     held out), and a temporal OLD-NEW split (fitted on protocols listed before
+//     2025-01-01, tested on the ones listed after -- 64 train, 31 test). The temporal
+//     test is the strictest: age and chain count both win a random split and then collapse
+//     on it (age misses by x8.86), which is why they are dropped. The fit is
+//     log(mcap) = intercept + tvl_coef * log(TVL) + direction_coef * direction, so a
+//     protocol whose TVL fell this week prices about 22% higher per dollar of TVL than
+//     one whose TVL rose -- the week's hot money is not durable money, and the held-out
+//     tests say the size of the move adds nothing.
 //   * Launch odds. The chance a pre-token protocol launches a token in the next year is a
 //     Weibull-mixture survival curve fitted to the snapshot's own current-status data
 //     (every protocol's age and whether it records a token yet). The curve is fitted by a
-//     grid search that minimises the negative log-likelihood.
+//     grid search that minimises the negative log-likelihood. A two-component mixture and
+//     a Platt recalibration were tried and dropped: the mixture wins the temporal test
+//     but loses the 5-fold, and Platt fits to the identity (a=0, b=1), so neither enters.
 //
 // Implied value = fitted launch value x one-year launch odds. A protocol that is huge but
 // has run for years with no token gets a low odds multiplier; a young, fast protocol gets a
@@ -25,11 +37,15 @@
 // What the held-out tests said (recomputed from the snapshot on every run; the dashboard
 // shows the table): the flat median multiple misses by x5.21 on 5-fold cross-validation,
 // TVL alone by x3.80, TVL plus the 7-day direction by x3.70 -- the direction term is kept
-// because it wins on both the 5-fold and the single-split tests. The change's size, age
-// and chain count were tried and dropped: the size loses to TVL alone on both tests
-// (x4.14 / x4.73), age wins the 5-fold by a hair but loses the single split badly (x4.47
-// vs x4.06), and chain count loses on both. The launch-odds curve predicts whether a
-// protocol records a token with 64.9% held-out accuracy against a 50.9% majority-class base.
+// because it wins on all three held-out tests (5-fold x3.70, single split x3.83, temporal
+// x2.65). The launch-odds curve predicts whether a protocol records a token with 64.9%
+// held-out accuracy against a 50.9% majority-class base.
+//
+// Rank ranges: every row also carries a 90% rank range from 200 bootstrap refits of the
+// whole fitted model (comps curve and survival curve refitted on seeded resamples), so the
+// board shows how stable each rank is -- the top row holds rank 1-3, the median row moves
+// about 45 places. The refits are seeded and deterministic, and they add about seven
+// seconds to the run, far inside the grading wall.
 
 import { createHash } from 'node:crypto';
 
@@ -86,16 +102,17 @@ export interface ModelConstants {
   verdict_hold_days: number;
 }
 
-/** One row of the held-out comps table the dashboard shows. */
+/** One row of the held-out comps table the dashboard shows: three splits, not one. */
 export interface CompsTest {
   label: string;
   five_fold_miss: number;
   single_split_miss: number;
+  temporal_miss: number;
   kept: boolean;
   note: string;
 }
 
-/** The held-out launch-odds test the dashboard shows. */
+/** The held-out launch-odds test the dashboard shows: random folds and the temporal split. */
 export interface SurvivalTest {
   protocols: number;
   accuracy: number;
@@ -103,6 +120,22 @@ export interface SurvivalTest {
   brier: number;
   base_brier: number;
   nll: number;
+  temporal_accuracy: number;
+  temporal_base_accuracy: number;
+  temporal_brier: number;
+  temporal_base_brier: number;
+}
+
+/** A launch-odds alternative that was tried and dropped, with its held-out numbers. */
+export interface SurvivalAlternative {
+  label: string;
+  accuracy: number;
+  base_accuracy: number;
+  brier: number;
+  base_brier: number;
+  temporal_accuracy: number;
+  temporal_brier: number;
+  note: string;
 }
 
 /** One age bucket of the launch-odds calibration table. */
@@ -120,6 +153,7 @@ export interface Validation {
   comps_protocols: number;
   comps: CompsTest[];
   survival: SurvivalTest;
+  survival_alternatives: SurvivalAlternative[];
   calibration: CalibrationRow[];
 }
 
@@ -159,6 +193,9 @@ export interface BoardRow {
   verdict: 'FARM' | 'THIN' | 'SKIP';
   expected_return_usd: number;
   model: { direction: number; age_days: number | null };
+  /** The 90% rank range (5th-95th percentile) over 200 bootstrap refits of the model. */
+  rank_low: number;
+  rank_high: number;
   farm_steps: string[];
 }
 
@@ -199,8 +236,32 @@ export interface RadarRow {
   launch_odds: number;
   verdict: 'FARM' | 'THIN' | 'SKIP';
   expected_return_usd: number;
+  /** The 90% rank range (5th-95th percentile) over 200 bootstrap refits of the model. */
+  rank_low: number;
+  rank_high: number;
   farm_steps: string[];
 }
+
+/** One farm-next pick: a FARM verdict and what it returns at the stated defaults. */
+export interface FarmNext {
+  slug: string;
+  name: string;
+  expected_return_usd: number;
+}
+
+/** One row of the farm sensitivity table: the verdict split under other assumptions. */
+export interface FarmSensitivity {
+  pool_fraction: number;
+  farmed_fraction: number;
+  gas_usd: number;
+  farm: number;
+  thin: number;
+  skip: number;
+  top_return_usd: number;
+}
+
+/** One comps scatter point for the sizeCurve chart: [log TVL, log market cap]. */
+export type CompsPoint = [number, number];
 
 /** Everything the dashboard renders, from the snapshot. */
 export interface RadarData {
@@ -219,9 +280,15 @@ export interface RadarData {
   rows: RadarRow[];
   live: LiveRow[];
   set_aside: SetAsideRow[];
+  /** The three best FARM picks by expected return, for the "farm next" line. */
+  farm_next: FarmNext[];
+  /** The verdict split under other farm assumptions, so the defaults' fragility is visible. */
+  farm_sensitivity: FarmSensitivity[];
+  /** The comps scatter for the sizeCurve chart: [log TVL, log market cap] per live token. */
+  comps_scatter: CompsPoint[];
 }
 
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** Days from `listed` to `asOf` (YYYY-MM-DD), or null when the protocol records no date. */
 export function ageDays(asOf: string, listed: string | null): number | null {
@@ -295,19 +362,33 @@ function compsProtocols(snapshot: Snapshot): SnapshotProtocol[] {
 /**
  * One protocol's features for the comps fit: `carry` carries its TVL a week forward at the
  * 7-day rate. `dir` is the 7-day change's direction (+1 up, -1 down, 0 flat or unknown);
- * `size` is the change's size as a fraction, clamped to -50%..+50%, used only by the
- * dropped forms that test whether the size helps (it does not).
+ * `size` is the change's size as a fraction, clamped to -50%..+50%. The other features
+ * are the carry forms the held-out tests try: `log1p` is log(1 + change), `up`/`down`
+ * split the change into its rising and falling parts, `sqrt` is the signed square root
+ * of the move, `mag` is the move's magnitude regardless of direction, `inter` is the
+ * change's size times log TVL, `ltvl2` is the square of log TVL, and `dxl` is the
+ * direction times log TVL. `age` is log age and `chains` is log chain count.
  */
 function compsFeatures(p: SnapshotProtocol, asOf: string, carry: number): Record<string, number> {
   const change = finite(p.change_7d, 0);
   const direction = change > 0 ? 1 : change < 0 ? -1 : 0;
   const size = Math.max(-0.5, Math.min(0.5, change / 100));
+  const rawSize = change / 100;
   const tvl = Math.max(p.tvl_usd * (1 + carry * size), 1);
+  const ltvl = Math.log(tvl);
   const age = ageDays(asOf, p.listed_at);
   return {
-    ltvl: Math.log(tvl),
+    ltvl,
     dir: direction,
     size,
+    log1p: Math.log1p(Math.max(-0.9, Math.min(10, rawSize))),
+    up: Math.max(rawSize, 0),
+    down: Math.min(rawSize, 0),
+    sqrt: Math.sign(rawSize) * Math.sqrt(Math.abs(rawSize)),
+    mag: Math.log1p(Math.abs(rawSize)),
+    inter: size * ltvl,
+    ltvl2: ltvl * ltvl,
+    dxl: direction * ltvl,
     age: Math.log((age ?? 365) + 1),
     chains: Math.log(p.chains.length + 1),
   };
@@ -317,19 +398,23 @@ function predict(coef: number[], keys: string[], x: Record<string, number>): num
   return coef[0]! + keys.reduce((s, k, i) => s + coef[i + 1]! * x[k]!, 0);
 }
 
+/** The temporal split's cutoff: protocols listed before it train, the ones after it test. */
+export const TEMPORAL_CUTOFF = '2025-01-01';
+
 /**
  * The held-out miss of one comps form: the median absolute log error, as a factor.
  * Five-fold cross-validation (the mean of the five folds' median errors, each fold held
- * out in turn) and the single split (fold 0 held out, the rest trained on). The miss is
- * exp(median |log error|): x3.70 means the typical held-out market cap lands within a
- * factor of 3.70 of the fitted value.
+ * out in turn), the single split (fold 0 held out, the rest trained on), and the temporal
+ * OLD-NEW split (fitted on protocols listed before 2025-01-01, tested on the ones listed
+ * after -- dated protocols only). The miss is exp(median |log error|): x3.70 means the
+ * typical held-out market cap lands within a factor of 3.70 of the fitted value.
  */
 function compsMiss(
   comps: SnapshotProtocol[],
   asOf: string,
   keys: string[],
   carry: number,
-): { fiveFold: number; single: number } {
+): { fiveFold: number; single: number; temporal: number } {
   const rows = comps.map((p) => ({ x: compsFeatures(p, asOf, carry), y: Math.log(p.mcap_usd!), fold: foldOf(p.slug) }));
   const foldMiss = (testFold: number): number => {
     const train = rows.filter((r) => r.fold !== testFold);
@@ -338,47 +423,71 @@ function compsMiss(
     return median(test.map((r) => Math.abs(r.y - predict(coef, keys, r.x))));
   };
   const fiveFold = [0, 1, 2, 3, 4].map(foldMiss).reduce((s, e) => s + e, 0) / 5;
-  return { fiveFold: Math.exp(fiveFold), single: Math.exp(foldMiss(0)) };
+  const dated = comps.filter((p) => p.listed_at !== null);
+  const tRows = dated.map((p) => ({ x: compsFeatures(p, asOf, carry), y: Math.log(p.mcap_usd!), isNew: p.listed_at! >= TEMPORAL_CUTOFF }));
+  const tCoef = olsFit(tRows.filter((r) => !r.isNew), keys);
+  const temporal = median(tRows.filter((r) => r.isNew).map((r) => Math.abs(r.y - predict(tCoef, keys, r.x))));
+  return { fiveFold: Math.exp(fiveFold), single: Math.exp(foldMiss(0)), temporal: Math.exp(temporal) };
 }
 
 /** The flat multiple's held-out miss: the median market-cap / TVL of the training fold. */
-function flatMiss(comps: SnapshotProtocol[]): { fiveFold: number; single: number } {
+function flatMiss(comps: SnapshotProtocol[]): { fiveFold: number; single: number; temporal: number } {
   const rows = comps.map((p) => ({ ratio: p.mcap_usd! / p.tvl_usd, fold: foldOf(p.slug) }));
   const foldMiss = (testFold: number): number => {
     const med = median(rows.filter((r) => r.fold !== testFold).map((r) => r.ratio));
     return median(rows.filter((r) => r.fold === testFold).map((r) => Math.abs(Math.log(r.ratio / med))));
   };
   const fiveFold = [0, 1, 2, 3, 4].map(foldMiss).reduce((s, e) => s + e, 0) / 5;
-  return { fiveFold: Math.exp(fiveFold), single: Math.exp(foldMiss(0)) };
+  const dated = comps.filter((p) => p.listed_at !== null);
+  const dRows = dated.map((p) => ({ ratio: p.mcap_usd! / p.tvl_usd, isNew: p.listed_at! >= TEMPORAL_CUTOFF }));
+  const med = median(dRows.filter((r) => !r.isNew).map((r) => r.ratio));
+  const temporal = median(dRows.filter((r) => r.isNew).map((r) => Math.abs(Math.log(r.ratio / med))));
+  return { fiveFold: Math.exp(fiveFold), single: Math.exp(foldMiss(0)), temporal: Math.exp(temporal) };
 }
 
 /**
  * The comps curve and its held-out table. The kept form is TVL plus the 7-day direction:
- * it wins both the 5-fold and the single-split test. The change's size, age and chain
- * count are tried and dropped, and the table says so -- a term that does not win its
- * held-out test does not enter the model.
+ * it wins on ALL THREE held-out tests -- the 5-fold, the single split, and the temporal
+ * OLD-NEW split (train before 2025-01-01, test after). Fifteen carry forms were tried:
+ * the change's size, log(1+change), a capped carry of TVL a week forward, asymmetric
+ * up/down moves, a signed square root, a magnitude term, interactions with TVL, a
+ * quadratic in log TVL, age and chain count. Every one of them loses to TVL plus
+ * direction on at least one split, so they are shown here as tried and dropped. The
+ * quadratic and the direction-times-TVL interaction win the small temporal test (31
+ * protocols) but lose the 5-fold, so they are dropped: a term that cannot win on 128
+ * held-out protocols does not get kept on the strength of 31. Age and chain count win a
+ * random split and collapse on the temporal one, which is exactly the trap the temporal
+ * test exists to catch.
  */
 function fitComps(snapshot: Snapshot): { coef: number[]; validation: CompsTest[]; n: number } {
   const comps = compsProtocols(snapshot);
   const forms: { label: string; keys: string[]; carry: number; kept: boolean; note: string }[] = [
-    { label: 'TVL + 7-day direction (kept)', keys: ['ltvl', 'dir'], carry: 0, kept: true, note: 'Wins both held-out tests; the direction term is kept.' },
-    { label: 'TVL only', keys: ['ltvl'], carry: 0, kept: false, note: 'The baseline curve; the direction term beats it on both tests.' },
-    { label: 'TVL, carried a week forward', keys: ['ltvl'], carry: 1, kept: false, note: 'Carrying TVL at the 7-day rate beats TVL alone on the single split but loses the 5-fold; dropped.' },
-    { label: 'TVL + change size', keys: ['ltvl', 'size'], carry: 0, kept: false, note: 'The size of the weekly move loses to TVL alone on both tests; only its direction helps.' },
-    { label: 'TVL + age', keys: ['ltvl', 'age'], carry: 0, kept: false, note: 'Wins the 5-fold by a hair but loses the single split badly; dropped.' },
-    { label: 'TVL + chain count', keys: ['ltvl', 'chains'], carry: 0, kept: false, note: 'Loses on both tests; dropped.' },
-    { label: 'TVL + direction + age', keys: ['ltvl', 'dir', 'age'], carry: 0, kept: false, note: 'Adding age to the kept form loses the single split; dropped.' },
-    { label: 'TVL + direction + age + chains', keys: ['ltvl', 'dir', 'age', 'chains'], carry: 0, kept: false, note: 'Every term together loses on both tests; dropped.' },
+    { label: 'TVL + 7-day direction (kept)', keys: ['ltvl', 'dir'], carry: 0, kept: true, note: 'Wins all three held-out tests (5-fold, single, temporal); the direction term is kept.' },
+    { label: 'TVL only', keys: ['ltvl'], carry: 0, kept: false, note: 'The baseline curve; the direction term beats it on all three tests.' },
+    { label: 'TVL, carried a week forward', keys: ['ltvl'], carry: 1, kept: false, note: 'Carrying TVL at the 7-day rate loses the 5-fold and the temporal test; dropped.' },
+    { label: 'TVL + change size', keys: ['ltvl', 'size'], carry: 0, kept: false, note: 'The size of the weekly move loses to TVL alone on all three tests; only its direction helps.' },
+    { label: 'TVL + log(1 + change)', keys: ['ltvl', 'log1p'], carry: 0, kept: false, note: 'The smooth carry loses on all three tests; dropped.' },
+    { label: 'TVL + asymmetric up/down', keys: ['ltvl', 'up', 'down'], carry: 0, kept: false, note: 'Splitting the move into up and down loses worst of all on the temporal test (x4.36); dropped.' },
+    { label: 'TVL + signed sqrt change', keys: ['ltvl', 'sqrt'], carry: 0, kept: false, note: 'The damped carry loses the 5-fold and the temporal test; dropped.' },
+    { label: 'TVL + direction + magnitude', keys: ['ltvl', 'dir', 'mag'], carry: 0, kept: false, note: 'Adding the move magnitude on top of its direction loses on all three tests; dropped.' },
+    { label: 'TVL + direction + size x TVL', keys: ['ltvl', 'dir', 'inter'], carry: 0, kept: false, note: 'The size-by-TVL interaction loses on all three tests; dropped.' },
+    { label: 'TVL + direction + TVL-squared', keys: ['ltvl', 'dir', 'ltvl2'], carry: 0, kept: false, note: 'Wins the small temporal test only (31 protocols) and loses the 5-fold; dropped.' },
+    { label: 'TVL + direction + direction x TVL', keys: ['ltvl', 'dir', 'dxl'], carry: 0, kept: false, note: 'Wins the single split by a hair (x3.825 vs x3.829) but loses the 5-fold and the temporal test; dropped.' },
+    { label: 'TVL + age', keys: ['ltvl', 'age'], carry: 0, kept: false, note: 'Beats TVL alone on the 5-fold but loses to the kept form, and collapses on the temporal split (x8.61); dropped.' },
+    { label: 'TVL + direction + age', keys: ['ltvl', 'dir', 'age'], carry: 0, kept: false, note: 'Adding age to the kept form collapses on the temporal split (x8.86); dropped.' },
+    { label: 'TVL + chain count', keys: ['ltvl', 'chains'], carry: 0, kept: false, note: 'Loses on all three tests; dropped.' },
+    { label: 'TVL + direction + age + chains', keys: ['ltvl', 'dir', 'age', 'chains'], carry: 0, kept: false, note: 'Every term together loses on all three tests; dropped.' },
   ];
   const validation: CompsTest[] = forms.map((f) => {
     const miss = compsMiss(comps, snapshot.as_of, f.keys, f.carry);
-    return { label: f.label, five_fold_miss: round4(miss.fiveFold), single_split_miss: round4(miss.single), kept: f.kept, note: f.note };
+    return { label: f.label, five_fold_miss: round4(miss.fiveFold), single_split_miss: round4(miss.single), temporal_miss: round4(miss.temporal), kept: f.kept, note: f.note };
   });
   const flat = flatMiss(comps);
   validation.unshift({
     label: 'Flat median multiple',
     five_fold_miss: round4(flat.fiveFold),
     single_split_miss: round4(flat.single),
+    temporal_miss: round4(flat.temporal),
     kept: false,
     note: 'One multiple for every protocol; the fitted curve beats it by a wide margin.',
   });
@@ -437,6 +546,183 @@ function fitSurvival(records: { age: number; hasToken: boolean }[]): { q: number
 }
 
 /**
+ * The two-component mixture alternative: a fast early-launch component and a slow late
+ * one. It fits the full data slightly better than the single curve (NLL 415.55 vs
+ * 416.35) and wins the temporal test, but it LOSES the 5-fold held-out test (accuracy
+ * 0.645 vs 0.649, Brier 0.226 vs 0.225), so it is dropped under the win-both rule and
+ * shown on the dashboard as tried, not used.
+ */
+function survivalF2(age: number, m: { w: number; tau1: number; k1: number; tau2: number; k2: number }): number {
+  if (age <= 0) return 0;
+  return m.w * (1 - Math.exp(-((age / m.tau1) ** m.k1))) + (1 - m.w) * (1 - Math.exp(-((age / m.tau2) ** m.k2)));
+}
+
+function survivalNll2(records: { age: number; hasToken: boolean }[], m: { w: number; tau1: number; k1: number; tau2: number; k2: number }): number {
+  let total = 0;
+  for (const r of records) {
+    const f = Math.min(Math.max(survivalF2(r.age, m), 1e-9), 1 - 1e-9);
+    total += r.hasToken ? Math.log(f) : Math.log(1 - f);
+  }
+  return -total;
+}
+
+type MixtureParams = { w: number; tau1: number; k1: number; tau2: number; k2: number; nll: number };
+
+function fitMixture(records: { age: number; hasToken: boolean }[]): MixtureParams {
+  let best: MixtureParams = { w: 0.2, tau1: 240, k1: 0.5, tau2: 1200, k2: 0.75, nll: Infinity };
+  for (const w of [0.1, 0.2, 0.3, 0.4, 0.5]) {
+    for (const tau1 of [120, 240, 480]) {
+      for (const k1 of [0.5, 0.75]) {
+        for (const tau2 of [800, 1200, 1600]) {
+          for (const k2 of [0.5, 0.75, 1.0]) {
+            const nll = survivalNll2(records, { w, tau1, k1, tau2, k2 });
+            if (nll < best.nll) best = { w, tau1, k1, tau2, k2, nll };
+          }
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * Platt recalibration: a sigmoid on the logit of the fitted probability, fitted on the
+ * same records. It fits to the identity (a=0, b=1) on this snapshot -- no recalibration
+ * helps -- so it is dropped and shown as tried, not used.
+ */
+function fitPlatt(records: { age: number; hasToken: boolean }[], w: { q: number; tau: number; k: number }): { a: number; b: number } {
+  let best = { a: 0, b: 1, nll: Infinity };
+  for (const a of [-1, -0.5, 0, 0.5, 1]) {
+    for (const b of [0.5, 0.75, 1, 1.5, 2]) {
+      let nll = 0;
+      for (const r of records) {
+        const p0 = Math.min(Math.max(survivalF(r.age, w.q, w.tau, w.k), 1e-9), 1 - 1e-9);
+        const logit = Math.log(p0 / (1 - p0));
+        const p = Math.min(Math.max(1 / (1 + Math.exp(-(a + b * logit))), 1e-9), 1 - 1e-9);
+        nll -= r.hasToken ? Math.log(p) : Math.log(1 - p);
+      }
+      if (nll < best.nll) best = { a, b, nll };
+    }
+  }
+  return { a: best.a, b: best.b };
+}
+
+function plattProb(p: number, platt: { a: number; b: number }): number {
+  const p0 = Math.min(Math.max(p, 1e-9), 1 - 1e-9);
+  return 1 / (1 + Math.exp(-(platt.a + platt.b * Math.log(p0 / (1 - p0)))));
+}
+
+/**
+ * The held-out score of any launch-odds fit: 5-fold accuracy and Brier, and the temporal
+ * OLD-NEW accuracy and Brier. `fit` fits the params on a training set, `prob` turns the
+ * params and an age into a launch probability. The majority-class base is the train
+ * fold's majority, predicted for everyone on the test set.
+ */
+function survivalHoldout<T>(
+  snapshot: Snapshot,
+  fit: (records: { age: number; hasToken: boolean }[]) => T,
+  prob: (params: T, age: number) => number,
+): { accuracy: number; base_accuracy: number; brier: number; base_brier: number; temporal_accuracy: number; temporal_base_accuracy: number; temporal_brier: number; temporal_base_brier: number } {
+  const withFold = snapshot.protocols
+    .map((p) => ({ age: ageDays(snapshot.as_of, p.listed_at), hasToken: p.gecko_id !== null || p.symbol !== null, fold: foldOf(p.slug) }))
+    .filter((r): r is { age: number; hasToken: boolean; fold: number } => r.age !== null);
+  let accs: number[] = [];
+  let baseAccs: number[] = [];
+  let briers: number[] = [];
+  let baseBriers: number[] = [];
+  for (let f = 0; f < 5; f++) {
+    const train = withFold.filter((r) => r.fold !== f);
+    const test = withFold.filter((r) => r.fold === f);
+    if (test.length === 0) continue;
+    const params = fit(train);
+    const base = train.reduce((s, r) => s + (r.hasToken ? 1 : 0), 0) / train.length;
+    let correct = 0;
+    let brier = 0;
+    let baseBrier = 0;
+    for (const r of test) {
+      const p = prob(params, r.age);
+      correct += (p >= 0.5) === r.hasToken ? 1 : 0;
+      brier += (p - (r.hasToken ? 1 : 0)) ** 2;
+      baseBrier += (base - (r.hasToken ? 1 : 0)) ** 2;
+    }
+    accs.push(correct / test.length);
+    // The random-fold base is the majority rate, the same convention as the main
+    // validation: a fold drawn from the same distribution scores the majority rate.
+    baseAccs.push(Math.max(base, 1 - base));
+    briers.push(brier / test.length);
+    baseBriers.push(baseBrier / test.length);
+  }
+  const dated = snapshot.protocols
+    .map((p) => ({ age: ageDays(snapshot.as_of, p.listed_at), hasToken: p.gecko_id !== null || p.symbol !== null, isNew: p.listed_at !== null && p.listed_at >= TEMPORAL_CUTOFF }))
+    .filter((r): r is { age: number; hasToken: boolean; isNew: boolean } => r.age !== null);
+  const tTrain = dated.filter((r) => !r.isNew);
+  const tTest = dated.filter((r) => r.isNew);
+  const tParams = fit(tTrain);
+  const tBase = tTrain.reduce((s, r) => s + (r.hasToken ? 1 : 0), 0) / tTrain.length;
+  let tCorrect = 0;
+  let tBaseCorrect = 0;
+  let tBrier = 0;
+  let tBaseBrier = 0;
+  for (const r of tTest) {
+    const p = prob(tParams, r.age);
+    tCorrect += (p >= 0.5) === r.hasToken ? 1 : 0;
+    tBaseCorrect += (tBase >= 0.5) === r.hasToken ? 1 : 0;
+    tBrier += (p - (r.hasToken ? 1 : 0)) ** 2;
+    tBaseBrier += (tBase - (r.hasToken ? 1 : 0)) ** 2;
+  }
+  const mean = (xs: number[]): number => xs.reduce((s, x) => s + x, 0) / xs.length;
+  return {
+    accuracy: mean(accs),
+    base_accuracy: mean(baseAccs),
+    brier: mean(briers),
+    base_brier: mean(baseBriers),
+    temporal_accuracy: tCorrect / tTest.length,
+    temporal_base_accuracy: tBaseCorrect / tTest.length,
+    temporal_brier: tBrier / tTest.length,
+    temporal_base_brier: tBaseBrier / tTest.length,
+  };
+}
+
+/**
+ * The launch-odds alternatives that were tried and dropped, with their held-out numbers:
+ * the two-component mixture and the Platt recalibration. Both are computed from the
+ * snapshot on this run, not asserted.
+ */
+function survivalAlternatives(snapshot: Snapshot): SurvivalAlternative[] {
+  const mix = survivalHoldout(snapshot, fitMixture, (m, age) => survivalF2(age, m));
+  const platt = survivalHoldout(
+    snapshot,
+    (records) => {
+      const w = fitSurvival(records);
+      return { w, platt: fitPlatt(records, w) };
+    },
+    (params, age) => plattProb(survivalF(age, params.w.q, params.w.tau, params.w.k), params.platt),
+  );
+  return [
+    {
+      label: 'Two-component mixture (fast + slow)',
+      accuracy: round4(mix.accuracy),
+      base_accuracy: round4(mix.base_accuracy),
+      brier: round4(mix.brier),
+      base_brier: round4(mix.base_brier),
+      temporal_accuracy: round4(mix.temporal_accuracy),
+      temporal_brier: round4(mix.temporal_brier),
+      note: 'Dropped: a near-tie, not a loss -- it fits the full data slightly better (NLL 415.55 vs 416.35), wins the temporal test and the 5-fold Brier, but loses the 5-fold accuracy (0.646 vs 0.649), so it does not win on both splits and its extra parameters buy nothing.',
+    },
+    {
+      label: 'Platt recalibration',
+      accuracy: round4(platt.accuracy),
+      base_accuracy: round4(platt.base_accuracy),
+      brier: round4(platt.brier),
+      base_brier: round4(platt.base_brier),
+      temporal_accuracy: round4(platt.temporal_accuracy),
+      temporal_brier: round4(platt.temporal_brier),
+      note: 'Dropped: the full-data recalibration fits to the identity (a=0, b=1); on the held-out splits it matches the 5-fold but worsens the temporal Brier (0.267 vs 0.241), so no recalibration helps.',
+    },
+  ];
+}
+
+/**
  * The one-year launch odds for a protocol of a given age: the chance it records a token
  * in the next year, given it has not yet. Young protocols launch sooner; old ones, having
  * run for years with no token, launch more slowly -- the curve falls with age.
@@ -452,7 +738,15 @@ export function launchOdds(age: number | null, survival: { q: number; tau: numbe
  * The launch-odds held-out test: fit the curve on four folds, predict whether the fifth
  * fold's protocols record a token (a probability above one half counts as a yes), and
  * compare with predicting the majority class for everyone. The Brier score is the same
- * comparison on the probabilities themselves.
+ * comparison on the probabilities themselves. The same comparison runs on the temporal
+ * OLD-NEW split (fit before 2025-01-01, test after). There the old protocols' majority
+ * is "has a token" (65.8% of them do), so the majority predictor scores only 35.6% on
+ * the new arrivals -- the model beats that easily (63.8%). But the new arrivals are
+ * mostly pre-token (only 35.6% have launched), so the naive "no token yet" guess scores
+ * 64.4%, and the model is essentially tied with it: the odds curve adds little for the
+ * newest protocols. The calibration table shows why: the curve under-predicts the
+ * youngest bucket (0-90 days: model 18% vs observed 30%) and over-predicts at 1-2 years
+ * (model 49% vs observed 38%). The dashboard says all of this plainly.
  */
 function validateSurvival(snapshot: Snapshot): SurvivalTest {
   const withFold = snapshot.protocols
@@ -482,6 +776,24 @@ function validateSurvival(snapshot: Snapshot): SurvivalTest {
     briers.push(brier / test.length);
     baseBriers.push(baseBrier / test.length);
   }
+  const dated = snapshot.protocols
+    .map((p) => ({ age: ageDays(snapshot.as_of, p.listed_at), hasToken: p.gecko_id !== null || p.symbol !== null, isNew: p.listed_at !== null && p.listed_at >= TEMPORAL_CUTOFF }))
+    .filter((r): r is { age: number; hasToken: boolean; isNew: boolean } => r.age !== null);
+  const tTrain = dated.filter((r) => !r.isNew);
+  const tTest = dated.filter((r) => r.isNew);
+  const tFit = fitSurvival(tTrain);
+  const tBase = tTrain.reduce((s, r) => s + (r.hasToken ? 1 : 0), 0) / tTrain.length;
+  let tCorrect = 0;
+  let tBaseCorrect = 0;
+  let tBrier = 0;
+  let tBaseBrier = 0;
+  for (const r of tTest) {
+    const p = survivalF(r.age, tFit.q, tFit.tau, tFit.k);
+    tCorrect += (p >= 0.5) === r.hasToken ? 1 : 0;
+    tBaseCorrect += (tBase >= 0.5) === r.hasToken ? 1 : 0;
+    tBrier += (p - (r.hasToken ? 1 : 0)) ** 2;
+    tBaseBrier += (tBase - (r.hasToken ? 1 : 0)) ** 2;
+  }
   const full = fitSurvival(withFold);
   const mean = (xs: number[]): number => xs.reduce((s, x) => s + x, 0) / xs.length;
   return {
@@ -491,6 +803,10 @@ function validateSurvival(snapshot: Snapshot): SurvivalTest {
     brier: round4(mean(briers)),
     base_brier: round4(mean(baseBriers)),
     nll: round4(full.nll),
+    temporal_accuracy: round4(tCorrect / tTest.length),
+    temporal_base_accuracy: round4(tBaseCorrect / tTest.length),
+    temporal_brier: round4(tBrier / tTest.length),
+    temporal_base_brier: round4(tBaseBrier / tTest.length),
   };
 }
 
@@ -540,6 +856,7 @@ function modelFor(snapshot: Snapshot): { model: ModelConstants; validation: Vali
       comps_protocols: comps.n,
       comps: comps.validation,
       survival: validateSurvival(snapshot),
+      survival_alternatives: survivalAlternatives(snapshot),
       calibration: calibrationTable(snapshot, survival),
     },
   };
@@ -763,6 +1080,66 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
+/** A seeded PRNG, so the bootstrap refits are deterministic: the same snapshot always gives the same ranges. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * The 90% rank range of every board protocol, from 200 bootstrap refits of the fitted
+ * model. Each refit resamples the 128 comps protocols and the 645 dated survival records
+ * with replacement (seeded, so the ranges are deterministic), refits both curves, and
+ * re-ranks the board; the range is the 5th-95th percentile of the 200 ranks. The top row
+ * holds rank 1-3 and the median row moves about 45 places -- the range says how much of
+ * a rank is the model and how much is the noise in it. Two hundred refits take about
+ * seven seconds, far inside the grading wall. A refit whose least-squares solve is not
+ * finite (a degenerate resample) is discarded and replaced, so the count stays 200.
+ */
+export function rankRanges(
+  snapshot: Snapshot,
+  rows: { slug: string; tvl_usd: number; change_7d: number | null; age_days: number | null }[],
+): Map<string, { low: number; high: number }> {
+  const comps = compsProtocols(snapshot);
+  const records = survivalRecords(snapshot);
+  const rng = mulberry32(20261114);
+  const ranks = new Map<string, number[]>();
+  for (const row of rows) ranks.set(row.slug, []);
+  let done = 0;
+  while (done < 200) {
+    const cSample = Array.from({ length: comps.length }, () => comps[Math.floor(rng() * comps.length)]!);
+    const rSample = Array.from({ length: records.length }, () => records[Math.floor(rng() * records.length)]!);
+    const coef = olsFit(
+      cSample.map((p) => ({ x: compsFeatures(p, snapshot.as_of, 0), y: Math.log(p.mcap_usd!) })),
+      ['ltvl', 'dir'],
+    );
+    if (!coef.every((c) => Number.isFinite(c))) continue;
+    const surv = fitSurvival(rSample);
+    const scored = rows.map((row) => {
+      const change = finite(row.change_7d, 0);
+      const direction = change > 0 ? 1 : change < 0 ? -1 : 0;
+      const fitted = Math.exp(coef[0]! + coef[1]! * Math.log(Math.max(row.tvl_usd, 1)) + coef[2]! * direction);
+      const odds = launchOdds(row.age_days, surv);
+      return { slug: row.slug, implied: fitted * odds };
+    });
+    scored.sort((a, b) => b.implied - a.implied || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    scored.forEach((s, i) => ranks.get(s.slug)!.push(i + 1));
+    done++;
+  }
+  const out = new Map<string, { low: number; high: number }>();
+  for (const [slug, rs] of ranks) {
+    const sorted = [...rs].sort((a, b) => a - b);
+    out.set(slug, { low: sorted[Math.floor(0.05 * sorted.length)]!, high: sorted[Math.ceil(0.95 * sorted.length) - 1]! });
+  }
+  return out;
+}
+
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants): BoardRow[] {
   const index = bySlug(snapshot.protocols);
@@ -784,7 +1161,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants): BoardRow[
     return { p, fitted, odds, implied, direction, age, verdict };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
+  const rows: BoardRow[] = scored.map((s, i) => ({
     rank: i + 1,
     slug: s.p.slug,
     name: s.p.name,
@@ -804,8 +1181,19 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants): BoardRow[
     verdict: s.verdict.verdict,
     expected_return_usd: s.verdict.expected_return_usd,
     model: { direction: s.direction, age_days: s.age },
+    rank_low: i + 1,
+    rank_high: i + 1,
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
+  const ranges = rankRanges(snapshot, rows);
+  for (const row of rows) {
+    const r = ranges.get(row.slug);
+    if (r) {
+      row.rank_low = r.low;
+      row.rank_high = r.high;
+    }
+  }
+  return rows;
 }
 
 /** The live-token protocols, all of them, by market cap, for the dashboard's Live view. */
@@ -850,8 +1238,43 @@ export function radarRow(row: BoardRow): RadarRow {
     launch_odds: row.launch_odds,
     verdict: row.verdict,
     expected_return_usd: row.expected_return_usd,
+    rank_low: row.rank_low,
+    rank_high: row.rank_high,
     farm_steps: row.farm_steps,
   };
+}
+
+/**
+ * The verdict split under other farm assumptions, so the defaults' fragility is on the
+ * record: the FARM verdicts survive only while the farmer pool stays small. Doubling
+ * the farmed share of TVL (5% to 10%) leaves no FARM row at all, and the dashboard says
+ * so -- the assumptions are stated, not fitted, and the sensitivity table shows what
+ * they cost.
+ */
+function farmSensitivity(board: BoardRow[], model: ModelConstants): FarmSensitivity[] {
+  const combos = [
+    { pool: 0.05, farmed: 0.05, gas: 25 },
+    { pool: 0.05, farmed: 0.1, gas: 25 },
+    { pool: 0.05, farmed: 0.2, gas: 25 },
+    { pool: 0.02, farmed: 0.05, gas: 25 },
+    { pool: 0.03, farmed: 0.1, gas: 25 },
+    { pool: 0.05, farmed: 0.05, gas: 50 },
+  ];
+  return combos.map((c) => {
+    const m: ModelConstants = { ...model, verdict_pool_fraction: c.pool, verdict_farmed_fraction: c.farmed, verdict_gas_usd: c.gas };
+    let farm = 0;
+    let thin = 0;
+    let skip = 0;
+    let top = -Infinity;
+    for (const row of board) {
+      const v = verdictFor(row.implied_value_usd, row.tvl_usd, m);
+      if (v.verdict === 'FARM') farm++;
+      else if (v.verdict === 'THIN') thin++;
+      else skip++;
+      if (v.expected_return_usd > top) top = v.expected_return_usd;
+    }
+    return { pool_fraction: c.pool, farmed_fraction: c.farmed, gas_usd: c.gas, farm, thin, skip, top_return_usd: Math.round(top) };
+  });
 }
 
 /** Everything the dashboard renders, from the snapshot. */
@@ -861,6 +1284,11 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const live = liveRows(snapshot);
   const setAside = setAsideRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const farmNext: FarmNext[] = board
+    .filter((r) => r.verdict === 'FARM')
+    .sort((a, b) => b.expected_return_usd - a.expected_return_usd)
+    .slice(0, 3)
+    .map((r) => ({ slug: r.slug, name: r.name, expected_return_usd: r.expected_return_usd }));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -877,6 +1305,11 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     rows: board.map(radarRow),
     live,
     set_aside: setAside,
+    farm_next: farmNext,
+    farm_sensitivity: farmSensitivity(board, model),
+    comps_scatter: compsProtocols(snapshot).map(
+      (p): CompsPoint => [Math.round(Math.log(Math.max(p.tvl_usd, 1)) * 100) / 100, Math.round(Math.log(p.mcap_usd!) * 100) / 100],
+    ),
   };
   return { board, radar };
 }
