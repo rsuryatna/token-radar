@@ -4,14 +4,21 @@
 [![rank](https://make.fun/badge/token-radar-01/rsuryatna/token-radar/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![reward](https://make.fun/badge/token-radar-01/rsuryatna/token-radar/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
-A token launch radar: it reads a frozen snapshot of 758 DeFi protocols, ranks the 198 pre-token
-ones by what a token would be worth if the protocol kept running as it is, and gives each one a
-six-step farm plan with costs and times. The implied value comes only from the snapshot's own
-figures — TVL, seven-day growth, and how long the protocol has run with no token — with the
-market multiple taken as the median market-cap-to-TVL ratio of the snapshot's live-token
-protocols. The watchlist's 40 protocols are the floor; the 158 early rows below it pass the
-same rule. The dashboard is a static page with a sortable, filterable board, a detail view for
-every protocol, and a live-token view for contrast.
+A token launch radar, rebuilt around a fitted and validated value model. It reads a frozen
+snapshot of 758 DeFi protocols and accounts for all of them: 198 pre-token protocols ranked
+by implied launch value, 416 that already trade, and 144 set aside by the watchlist's own
+rule, each with the reason it was set aside. The implied value is a fitted launch value
+times a one-year launch odds — the launch value comes from a log-log comps curve fitted on
+the snapshot's own 128 live-token protocols (TVL plus the direction of the seven-day
+change), and the odds come from a Weibull-mixture survival curve fitted on every
+protocol's age and whether it records a token yet. Both fits are validated on held-out
+protocols the fits never saw, and the dashboard shows the validation table, including the
+terms that were tried and dropped. Every board row also carries a farm verdict
+(FARM / THIN / SKIP) with an expected dollar return at a $1,000 deposit, a what-if control
+that recomputes the verdicts live, and a six-step farm plan with costs and times. The
+dashboard is a static page with a sortable, filterable board, a detail view for every
+protocol, a live-token view, a set-aside view, and a model section that shows the fitted
+formula, the held-out numbers, and the launch-odds curve.
 
 ## Run it
 
