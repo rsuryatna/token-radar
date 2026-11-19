@@ -1,7 +1,7 @@
-// Token Radar's program, version radar-4 (Node 22, standard library only).
+// Token Radar's program, version radar-6 (Node 22, standard library only).
 //
 // It reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits the
-// radar-4 model on the snapshot's own live-token protocols, ranks every launch candidate
+// radar-6 model on the snapshot's own live-token protocols, ranks every launch candidate
 // by implied value, writes the ranked board to /output/board.json, writes the dashboard's
 // data beside the page as /output/data.js, copies this repository's dashboard/ and
 // screenshots/ to /output, and writes /output/dossier.json with the vendored make.fun
@@ -93,17 +93,26 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 // so a reader can see what the board claims without opening the dashboard.
 const m = radar.model;
 const kept = radar.validation.comps.find((c) => c.kept)!;
+const flat = radar.validation.comps.find((c) => c.label.startsWith('Flat'))!;
 const verdicts = { FARM: 0, THIN: 0, SKIP: 0 };
 for (const r of board) verdicts[r.verdict]++;
 const top = board[0]!;
 const bottom = board[board.length - 1]!;
 const s = radar.validation.survival;
+const taus = Object.entries(m.survival_taus)
+  .sort((a, b) => a[1] - b[1])
+  .map(([sector, tau]) => `${sector} ${tau}d`)
+  .join(', ');
+const premiums = Object.entries(m.sector_premiums)
+  .sort((a, b) => b[1] - a[1])
+  .map(([sector, prem]) => `${sector} ${prem >= 0 ? '+' : ''}${prem}`)
+  .join(', ');
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live, ${radar.set_aside_size} set aside)\n` +
-    `token radar: comps log(mcap) = ${m.intercept} + ${m.tvl_coef} * log(TVL) + ${m.direction_coef} * direction, fitted on ${radar.validation.comps_protocols} live-token protocols\n` +
-    `token radar: held-out miss ${kept.label}: 5-fold x${kept.five_fold_miss}, single split x${kept.single_split_miss}, temporal OLD-NEW x${kept.temporal_miss} (flat multiple x${radar.validation.comps[0]!.five_fold_miss})\n` +
-    `token radar: launch odds q=${m.survival_q} tau=${m.survival_tau} k=${m.survival_k}, held-out accuracy ${s.accuracy} vs base ${s.base_accuracy} (temporal ${s.temporal_accuracy} vs base ${s.temporal_base_accuracy}), Brier ${s.brier} vs base ${s.base_brier}\n` +
+    `token radar: comps log(mcap) = ${m.intercept} + ${m.tvl_coef} * log(TVL) + ${m.direction_coef} * direction + sector premium [${premiums}], fitted on ${radar.validation.comps_protocols} live-token protocols\n` +
+    `token radar: held-out miss ${kept.label}: 5-fold x${kept.five_fold_miss}, single split x${kept.single_split_miss}, temporal OLD-NEW x${kept.temporal_miss} (flat multiple x${flat.five_fold_miss}); second temporal cutoff 2024-07-01: kept x${radar.validation.comps_temporal2.kept_miss} vs baseline x${radar.validation.comps_temporal2.baseline_miss}\n` +
+    `token radar: launch odds sector-Weibull q=${m.survival_q} k=${m.survival_k}, taus: ${taus} (pooled ${m.survival_pooled_tau}d), held-out accuracy ${s.accuracy} vs base ${s.base_accuracy} (temporal ${s.temporal_accuracy} vs naive ${1 - s.temporal_base_accuracy}), Brier ${s.brier} vs base ${s.base_brier}\n` +
     `token radar: top ${top.name} $${top.implied_value_usd.toLocaleString('en-US')} (rank range ${top.rank_low}-${top.rank_high}), bottom ${bottom.name} $${bottom.implied_value_usd.toLocaleString('en-US')}\n` +
-    `token radar: farm verdicts at $${m.verdict_deposit_usd}: FARM ${verdicts.FARM}, THIN ${verdicts.THIN}, SKIP ${verdicts.SKIP}\n` +
+    `token radar: farm verdicts at $${m.verdict_deposit_usd}: FARM ${verdicts.FARM}, THIN ${verdicts.THIN}, SKIP ${verdicts.SKIP}; best per hour ${radar.farm_next_best_hour.name} +$${radar.farm_next_best_hour.net_per_hour_usd}/h\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
